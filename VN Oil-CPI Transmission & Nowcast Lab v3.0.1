@@ -1,0 +1,561 @@
+//@version=6
+indicator("VN Oil-CPI Transmission & Nowcast Lab v3.0.1", shorttitle="VN Oil-CPI v3.0.1", overlay=false, max_labels_count=500, max_lines_count=300, max_bars_back=5000)
+
+//======================================================
+// 1) FIXED POLICY
+//======================================================
+const string OIL_BENCHMARK    = "TVC:UKOIL"
+const string CPI_MOM_OFFICIAL = "ECONOMICS:VNIRMM"
+const string CPI_YOY_OFFICIAL = "ECONOMICS:VNIRYY"
+const string CPI_TRANSPORT    = "ECONOMICS:VNCPIT"
+const int CPI_RELEASE_LAG     = 1
+
+//======================================================
+// 2) INPUT
+//======================================================
+groupModel = "1. Mo hinh"
+groupView  = "2. Hien thi"
+groupRisk  = "3. Nguong"
+
+panelView      = input.int(3, "Panel (1=VNCPIT, 2=Headline CPI, 3=Dashboard)", minval=1, maxval=3, group=groupView)
+headlineMode   = input.string("CPI MoM", "Headline target", options=["CPI MoM", "CPI YoY"], group=groupModel)
+
+corrLen        = input.int(24, "Rolling window (thang)", minval=12, maxval=60, group=groupModel)
+zLen           = input.int(24, "Z-score window", minval=12, maxval=60, group=groupModel)
+stabilityLen   = input.int(12, "Stability regime window", minval=6, maxval=24, group=groupModel)
+
+strongCorrThr  = input.float(0.50, "Nguong corr manh", minval=0.20, maxval=0.90, step=0.05, group=groupRisk)
+midCorrThr     = input.float(0.30, "Nguong corr vua", minval=0.10, maxval=0.80, step=0.05, group=groupRisk)
+shockZThr      = input.float(1.00, "Nguong oil shock z", minval=0.50, maxval=3.00, step=0.10, group=groupRisk)
+
+showTable      = input.bool(true, "Hien thi bang tom tat", group=groupView)
+showBG         = input.bool(true, "Hien thi background regime", group=groupView)
+showOilLine    = input.bool(true, "Hien thi oil live z-score", group=groupView)
+showScoreLine  = input.bool(true, "Hien thi pressure score", group=groupView)
+showLineLabels = input.bool(true, "Hien thi nhan ten duong", group=groupView)
+
+//======================================================
+// 3) HELPERS
+//======================================================
+f_pct(v) =>
+    na(v) ? "NA" : str.tostring(v, "#.##") + "%"
+
+f_num(v) =>
+    na(v) ? "NA" : str.tostring(v, "#.###")
+
+f_z(src, len) =>
+    _m = ta.sma(src, len)
+    _s = ta.stdev(src, len)
+    na(_m) or na(_s) or _s == 0 ? na : (src - _m) / _s
+
+f_strength(v, strongT, midT) =>
+    string _out = "Khong du du lieu"
+    if na(v)
+        _out := "Khong du du lieu"
+    else if math.abs(v) >= strongT
+        _out := "Manh"
+    else if math.abs(v) >= midT
+        _out := "Vua"
+    else
+        _out := "Yeu"
+    _out
+
+f_sign(v) =>
+    string _out = "NA"
+    if na(v)
+        _out := "NA"
+    else if v > 0
+        _out := "Duong"
+    else if v < 0
+        _out := "Am"
+    else
+        _out := "Trung tinh"
+    _out
+
+f_beta(x, y, len) =>
+    _corr = ta.correlation(x, y, len)
+    _sx   = ta.stdev(x, len)
+    _sy   = ta.stdev(y, len)
+    not na(_corr) and not na(_sx) and not na(_sy) and _sx != 0 ? _corr * (_sy / _sx) : na
+
+f_best_lag_012(c0, c1, c2) =>
+    _a0 = na(c0) ? -1.0 : math.abs(c0)
+    _a1 = na(c1) ? -1.0 : math.abs(c1)
+    _a2 = na(c2) ? -1.0 : math.abs(c2)
+
+    _lag = 0
+    _val = _a0
+
+    if _a1 > _val
+        _val := _a1
+        _lag := 1
+    if _a2 > _val
+        _val := _a2
+        _lag := 2
+
+    [_lag, _val]
+
+f_score_gap(c0, c1, c2, bestLag) =>
+    _a0 = na(c0) ? 0.0 : math.abs(c0)
+    _a1 = na(c1) ? 0.0 : math.abs(c1)
+    _a2 = na(c2) ? 0.0 : math.abs(c2)
+
+    _best = bestLag == 0 ? _a0 : bestLag == 1 ? _a1 : _a2
+    _runner = 0.0
+
+    if bestLag == 0
+        _runner := math.max(_a1, _a2)
+    else if bestLag == 1
+        _runner := math.max(_a0, _a2)
+    else
+        _runner := math.max(_a0, _a1)
+
+    _best - _runner
+
+f_sign_consistency(src, len) =>
+    _same = 0.0
+    _count = 0.0
+    for i = 0 to len - 1
+        if not na(src[i]) and not na(src[i + 1])
+            _count += 1
+            if (src[i] >= 0 and src[i + 1] >= 0) or (src[i] < 0 and src[i + 1] < 0)
+                _same += 1
+    _count > 0 ? _same / _count : na
+
+f_stability_regime(corrSeries, betaSeries, lagGap, strongT, midT, len) =>
+    _corrAbsMean = ta.sma(math.abs(corrSeries), len)
+    _corrStd     = ta.stdev(corrSeries, len)
+    _betaSignCon = f_sign_consistency(betaSeries, len)
+
+    float _score = 0.0
+    if not na(_corrAbsMean)
+        if _corrAbsMean >= strongT
+            _score += 2.0
+        else if _corrAbsMean >= midT
+            _score += 1.0
+
+    if not na(_corrStd)
+        if _corrStd <= 0.10
+            _score += 2.0
+        else if _corrStd <= 0.20
+            _score += 1.0
+
+    if not na(_betaSignCon)
+        if _betaSignCon >= 0.85
+            _score += 2.0
+        else if _betaSignCon >= 0.65
+            _score += 1.0
+
+    if not na(lagGap)
+        if lagGap >= 0.15
+            _score += 2.0
+        else if lagGap >= 0.05
+            _score += 1.0
+
+    string _regime = "Broken/Weak"
+    if _score >= 7
+        _regime := "Stable Strong"
+    else if _score >= 5
+        _regime := "Stable Moderate"
+    else if _score >= 3
+        _regime := "Unstable"
+    else
+        _regime := "Broken/Weak"
+
+    [_score, _regime, _corrAbsMean, _corrStd, _betaSignCon]
+
+f_confidence(corrAbs, bestLag, regime) =>
+    float _base = 0.0
+    if na(corrAbs)
+        _base := 0.0
+    else if corrAbs >= 0.50
+        _base := 0.85
+    else if corrAbs >= 0.30
+        _base := 0.60
+    else if corrAbs >= 0.20
+        _base := 0.40
+    else
+        _base := 0.20
+
+    float _penalty = 0.0
+    if bestLag == 1
+        _penalty := 0.12
+    else if bestLag == 2
+        _penalty := 0.22
+
+    float _regAdj = 0.0
+    if regime == "Stable Strong"
+        _regAdj := 0.10
+    else if regime == "Stable Moderate"
+        _regAdj := 0.00
+    else if regime == "Unstable"
+        _regAdj := -0.10
+    else
+        _regAdj := -0.20
+
+    _conf = math.max(0.0, math.min(1.0, _base - _penalty + _regAdj))
+
+    string _label = "Thap"
+    if _conf >= 0.70
+        _label := "Cao"
+    else if _conf >= 0.45
+        _label := "Vua"
+    else
+        _label := "Thap"
+
+    [_conf, _label]
+
+f_model_status(regime) =>
+    string _out = "Khong on dinh"
+    if regime == "Stable Strong"
+        _out := "Dang tin"
+    else if regime == "Stable Moderate"
+        _out := "Tam on"
+    else if regime == "Unstable"
+        _out := "Can than trong"
+    else
+        _out := "Khong on dinh"
+    _out
+
+f_direct_confirmation(regime, pressureLabel, corr0Abs) =>
+    string _out = "Yeu"
+    if (regime == "Stable Strong" or regime == "Stable Moderate") and (pressureLabel == "Cao" or pressureLabel == "Vua") and not na(corr0Abs) and corr0Abs >= 0.20
+        _out := "Xac nhan"
+    else if regime == "Broken/Weak" or na(corr0Abs) or corr0Abs < 0.10
+        _out := "Khong xac nhan"
+    else
+        _out := "Yeu"
+    _out
+
+f_lag_text(bestLag) =>
+    string _out = "Khong ro"
+    if bestLag == 0
+        _out := "Cung thang troi"
+    else if bestLag == 1
+        _out := "Tre 1 thang troi"
+    else if bestLag == 2
+        _out := "Tre 2 thang troi"
+    _out
+
+f_takeaway(pressureLabel, regime, targetName) =>
+    string _txt = "Chua co tin hieu ro rang"
+    if pressureLabel == "Cao"
+        _txt := "Dau dang tao ap luc tang manh len " + targetName + " thang hien tai"
+    else if pressureLabel == "Vua"
+        _txt := "Dau dang tao ap luc tang vua len " + targetName + " thang hien tai"
+    else if pressureLabel == "Giam ap luc"
+        _txt := "Dau dang giam ap luc len " + targetName + " thang hien tai"
+    else if regime == "Unstable" or regime == "Broken/Weak"
+        _txt := "Mo hinh lien he hien chua du on dinh"
+    _txt
+
+//======================================================
+// 4) DATA
+//======================================================
+oilM     = request.security(OIL_BENCHMARK, "M", close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+oilMOpen = request.security(OIL_BENCHMARK, "M", open,  gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+cpiMoMRaw  = request.security(CPI_MOM_OFFICIAL, "M", close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+cpiYoYRaw  = request.security(CPI_YOY_OFFICIAL, "M", close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+vncpitRaw  = request.security(CPI_TRANSPORT,   "M", close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+//======================================================
+// 5) SERIES ALIGNMENT
+//======================================================
+oilRetM  = not na(oilM) and not na(oilM[1]) ? (oilM / oilM[1] - 1.0) * 100.0 : na
+oilMTD   = not na(oilM) and not na(oilMOpen) and oilMOpen != 0 ? (oilM / oilMOpen - 1.0) * 100.0 : na
+zOilLive = f_z(oilMTD, zLen)
+
+cpiMoMRef   = cpiMoMRaw[CPI_RELEASE_LAG]
+cpiYoYRef   = cpiYoYRaw[CPI_RELEASE_LAG]
+headlineRef = headlineMode == "CPI MoM" ? cpiMoMRef : cpiYoYRef
+
+vncpitMoMRaw = not na(vncpitRaw) and not na(vncpitRaw[1]) and vncpitRaw[1] != 0 ? (vncpitRaw / vncpitRaw[1] - 1.0) * 100.0 : na
+vncpitRef    = vncpitMoMRaw[CPI_RELEASE_LAG]
+
+//======================================================
+// 6) DIRECT PANEL: UKOIL -> VNCPIT
+//======================================================
+enoughDirect = not na(vncpitRef) and not na(vncpitRef[corrLen]) and not na(oilRetM[CPI_RELEASE_LAG + 2])
+
+dCorr0 = enoughDirect ? ta.correlation(oilRetM[CPI_RELEASE_LAG],     vncpitRef, corrLen) : na
+dCorr1 = enoughDirect ? ta.correlation(oilRetM[CPI_RELEASE_LAG + 1], vncpitRef, corrLen) : na
+dCorr2 = enoughDirect ? ta.correlation(oilRetM[CPI_RELEASE_LAG + 2], vncpitRef, corrLen) : na
+
+[dBestLag, _dBestAbs] = f_best_lag_012(dCorr0, dCorr1, dCorr2)
+
+float dBestCorr = na
+if dBestLag == 0
+    dBestCorr := dCorr0
+else if dBestLag == 1
+    dBestCorr := dCorr1
+else
+    dBestCorr := dCorr2
+
+dGap   = f_score_gap(dCorr0, dCorr1, dCorr2, dBestLag)
+dBeta0 = enoughDirect ? f_beta(oilRetM[CPI_RELEASE_LAG], vncpitRef, corrLen) : na
+[dStabScore, dRegime, dCorrAbsMean, dCorrStd, dBetaSignCon] = f_stability_regime(dCorr0, dBeta0, dGap, strongCorrThr, midCorrThr, stabilityLen)
+
+dMeanOil    = ta.sma(oilRetM[CPI_RELEASE_LAG], corrLen)
+dMeanTarget = ta.sma(vncpitRef, corrLen)
+dIntercept  = not na(dMeanTarget) and not na(dBeta0) and not na(dMeanOil) ? dMeanTarget - dBeta0 * dMeanOil : na
+dNowcast    = not na(dIntercept) and not na(dBeta0) and not na(oilMTD) ? dIntercept + dBeta0 * oilMTD : na
+dPressureScore = not na(zOilLive) and not na(dCorr0) ? zOilLive * dCorr0 : na
+
+string dPressureLabel = "Khong du du lieu"
+string dPressureDir   = "NA"
+if not na(dPressureScore)
+    if dPressureScore >= shockZThr * 0.30
+        dPressureLabel := "Cao"
+        dPressureDir   := "Tang"
+    else if dPressureScore > 0
+        dPressureLabel := "Vua"
+        dPressureDir   := "Tang"
+    else if dPressureScore <= -shockZThr * 0.30
+        dPressureLabel := "Giam ap luc"
+        dPressureDir   := "Giam"
+    else
+        dPressureLabel := "Thap"
+        dPressureDir   := "Trung tinh"
+
+[dConfScore, dConfLabel] = f_confidence(math.abs(dCorr0), dBestLag, dRegime)
+dModelStatus = f_model_status(dRegime)
+dDirectConfirm = f_direct_confirmation(dRegime, dPressureLabel, math.abs(dCorr0))
+
+//======================================================
+// 7) HEADLINE PANEL: UKOIL -> CPI
+//======================================================
+enoughHead = not na(headlineRef) and not na(headlineRef[corrLen]) and not na(oilRetM[CPI_RELEASE_LAG + 2])
+
+hCorr0 = enoughHead ? ta.correlation(oilRetM[CPI_RELEASE_LAG],     headlineRef, corrLen) : na
+hCorr1 = enoughHead ? ta.correlation(oilRetM[CPI_RELEASE_LAG + 1], headlineRef, corrLen) : na
+hCorr2 = enoughHead ? ta.correlation(oilRetM[CPI_RELEASE_LAG + 2], headlineRef, corrLen) : na
+
+[hBestLag, _hBestAbs] = f_best_lag_012(hCorr0, hCorr1, hCorr2)
+
+float hBestCorr = na
+if hBestLag == 0
+    hBestCorr := hCorr0
+else if hBestLag == 1
+    hBestCorr := hCorr1
+else
+    hBestCorr := hCorr2
+
+hGap   = f_score_gap(hCorr0, hCorr1, hCorr2, hBestLag)
+hBeta0 = enoughHead ? f_beta(oilRetM[CPI_RELEASE_LAG], headlineRef, corrLen) : na
+[hStabScore, hRegime, hCorrAbsMean, hCorrStd, hBetaSignCon] = f_stability_regime(hCorr0, hBeta0, hGap, strongCorrThr, midCorrThr, stabilityLen)
+
+hMeanOil    = ta.sma(oilRetM[CPI_RELEASE_LAG], corrLen)
+hMeanTarget = ta.sma(headlineRef, corrLen)
+hIntercept  = not na(hMeanTarget) and not na(hBeta0) and not na(hMeanOil) ? hMeanTarget - hBeta0 * hMeanOil : na
+hNowcast    = not na(hIntercept) and not na(hBeta0) and not na(oilMTD) ? hIntercept + hBeta0 * oilMTD : na
+hPressureScore = not na(zOilLive) and not na(hCorr0) ? zOilLive * hCorr0 : na
+
+string hPressureLabel = "Khong du du lieu"
+string hPressureDir   = "NA"
+if not na(hPressureScore)
+    if hPressureScore >= shockZThr * 0.30
+        hPressureLabel := "Cao"
+        hPressureDir   := "Tang"
+    else if hPressureScore > 0
+        hPressureLabel := "Vua"
+        hPressureDir   := "Tang"
+    else if hPressureScore <= -shockZThr * 0.30
+        hPressureLabel := "Giam ap luc"
+        hPressureDir   := "Giam"
+    else
+        hPressureLabel := "Thap"
+        hPressureDir   := "Trung tinh"
+
+[hConfScore, hConfLabel] = f_confidence(math.abs(hCorr0), hBestLag, hRegime)
+hModelStatus = f_model_status(hRegime)
+hDirectConfirm = f_direct_confirmation(dRegime, dPressureLabel, math.abs(dCorr0))
+
+//======================================================
+// 8) SELECTED VIEW + SUMMARY
+//======================================================
+selTargetName    = panelView == 1 ? "VNCPIT" : headlineMode == "CPI MoM" ? "headline CPI MoM" : "headline CPI YoY"
+selRefCpi        = panelView == 1 ? vncpitRef : headlineRef
+selCorr0         = panelView == 1 ? dCorr0 : hCorr0
+selBestLag       = panelView == 1 ? dBestLag : hBestLag
+selBestCorr      = panelView == 1 ? dBestCorr : hBestCorr
+selBeta0         = panelView == 1 ? dBeta0 : hBeta0
+selRegime        = panelView == 1 ? dRegime : hRegime
+selPressureScore = panelView == 1 ? dPressureScore : hPressureScore
+selPressureLabel = panelView == 1 ? dPressureLabel : hPressureLabel
+selPressureDir   = panelView == 1 ? dPressureDir : hPressureDir
+selConfLabel     = panelView == 1 ? dConfLabel : hConfLabel
+selModelStatus   = panelView == 1 ? dModelStatus : hModelStatus
+selNowcast       = panelView == 1 ? dNowcast : hNowcast
+
+dashboardPressure = hPressureScore
+dashboardDirect   = dPressureScore
+dashboardConf     = hConfLabel
+dashboardTakeaway = f_takeaway(hPressureLabel, hRegime, "headline CPI")
+dashboardDirectConfirm = hDirectConfirm
+dashboardModelStatus   = hModelStatus
+dashboardLagText       = f_lag_text(hBestLag)
+dashboardHistText      = f_strength(hBestCorr, strongCorrThr, midCorrThr) + " | " + f_sign(hBestCorr)
+
+//======================================================
+// 9) BACKGROUND
+//======================================================
+color bgCol = na
+if panelView == 1
+    if dPressureLabel == "Cao"
+        bgCol := color.new(color.red, 89)
+    else if dPressureLabel == "Vua"
+        bgCol := color.new(color.orange, 90)
+    else if dPressureLabel == "Giam ap luc"
+        bgCol := color.new(color.teal, 90)
+    else if dRegime == "Broken/Weak"
+        bgCol := color.new(color.gray, 91)
+else if panelView == 2
+    if hPressureLabel == "Cao"
+        bgCol := color.new(color.red, 89)
+    else if hPressureLabel == "Vua"
+        bgCol := color.new(color.orange, 90)
+    else if hPressureLabel == "Giam ap luc"
+        bgCol := color.new(color.teal, 90)
+    else if hRegime == "Broken/Weak"
+        bgCol := color.new(color.gray, 91)
+else
+    if hPressureLabel == "Cao"
+        bgCol := color.new(color.red, 90)
+    else if hPressureLabel == "Giam ap luc"
+        bgCol := color.new(color.teal, 91)
+    else
+        bgCol := color.new(color.orange, 92)
+
+bgcolor(showBG ? bgCol : na)
+
+//======================================================
+// 10) PLOTS - DASHBOARD CHI GIU 2 LINE
+//======================================================
+hline(0, "Zero", color=color.new(color.gray, 72))
+hline(1, "High", color=color.new(color.red, 88))
+hline(-1, "Low", color=color.new(color.teal, 88))
+
+plotOilSeries = zOilLive
+plotHeadlineScore = panelView == 2 or panelView == 3 ? hPressureScore : na
+plotDirectScore   = panelView == 1 ? dPressureScore : na
+
+pOil = plot(showOilLine ? plotOilSeries : na, "Oil live z", color=color.orange, linewidth=3)
+pHeadline = plot(showScoreLine ? plotHeadlineScore : na, "Headline pressure", color=color.aqua, linewidth=3)
+pDirect = plot(showScoreLine ? plotDirectScore : na, "VNCPIT pressure", color=color.yellow, linewidth=2)
+
+//======================================================
+// 11) NHAN TEN DUONG
+//======================================================
+var label lblOil = na
+var label lblHeadline = na
+var label lblDirect = na
+
+if barstate.islast and showLineLabels
+    if not na(lblOil)
+        label.delete(lblOil)
+    if not na(lblHeadline)
+        label.delete(lblHeadline)
+    if not na(lblDirect)
+        label.delete(lblDirect)
+
+    if showOilLine and not na(plotOilSeries)
+        lblOil := label.new(bar_index, plotOilSeries, "Oil live z", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.white, color=color.new(color.orange, 0), size=size.small)
+
+    if showScoreLine and not na(plotHeadlineScore)
+        lblHeadline := label.new(bar_index, plotHeadlineScore, panelView == 3 ? "Headline pressure" : "Headline pressure", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.white, color=color.new(color.aqua, 0), size=size.small)
+
+    if showScoreLine and not na(plotDirectScore)
+        lblDirect := label.new(bar_index, plotDirectScore, "VNCPIT pressure", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=color.new(color.yellow, 0), size=size.small)
+
+//======================================================
+// 12) TABLE
+//======================================================
+var table tb = table.new(position.top_right, 2, 13, border_width=1)
+
+headerBg = color.rgb(58, 64, 80)
+leftBg   = color.rgb(28, 30, 36)
+rightBg  = color.rgb(18, 20, 25)
+textCol  = color.white
+
+regimeBg = color.rgb(70, 70, 70)
+if selRegime == "Stable Strong"
+    regimeBg := color.rgb(120, 40, 40)
+else if selRegime == "Stable Moderate"
+    regimeBg := color.rgb(110, 80, 25)
+else if selRegime == "Unstable"
+    regimeBg := color.rgb(80, 80, 40)
+else if selRegime == "Broken/Weak"
+    regimeBg := color.rgb(55, 55, 55)
+
+liveBg = color.rgb(40, 65, 40)
+if selPressureLabel == "Cao"
+    liveBg := color.rgb(120, 35, 35)
+else if selPressureLabel == "Vua"
+    liveBg := color.rgb(120, 85, 25)
+else if selPressureLabel == "Giam ap luc"
+    liveBg := color.rgb(25, 95, 95)
+
+confBg = color.rgb(95, 55, 40)
+if dashboardConf == "Cao"
+    confBg := color.rgb(35, 90, 45)
+else if dashboardConf == "Vua"
+    confBg := color.rgb(110, 85, 25)
+
+directBg = color.rgb(70, 70, 70)
+if dashboardDirectConfirm == "Xac nhan"
+    directBg := color.rgb(35, 90, 45)
+else if dashboardDirectConfirm == "Yeu"
+    directBg := color.rgb(110, 85, 25)
+else
+    directBg := color.rgb(85, 55, 55)
+
+modelBg = color.rgb(70, 70, 70)
+if dashboardModelStatus == "Dang tin"
+    modelBg := color.rgb(35, 90, 45)
+else if dashboardModelStatus == "Tam on"
+    modelBg := color.rgb(110, 85, 25)
+else if dashboardModelStatus == "Can than trong"
+    modelBg := color.rgb(95, 75, 40)
+else
+    modelBg := color.rgb(70, 70, 70)
+
+if barstate.islast and showTable
+    table.cell(tb, 0, 0, "VN Oil-CPI v3.0.1", text_color=textCol, bgcolor=headerBg)
+    table.cell(tb, 1, 0, panelView == 1 ? "VNCPIT Panel" : panelView == 2 ? "Headline Panel" : "Dashboard", text_color=textCol, bgcolor=headerBg)
+
+    table.cell(tb, 0, 1, "Oil benchmark", text_color=textCol, bgcolor=leftBg)
+    table.cell(tb, 1, 1, "Brent | UKOIL", text_color=textCol, bgcolor=rightBg)
+
+    table.cell(tb, 0, 2, "Target", text_color=textCol, bgcolor=leftBg)
+    table.cell(tb, 1, 2, panelView == 1 ? "VNCPIT MoM" : headlineMode, text_color=textCol, bgcolor=rightBg)
+
+    table.cell(tb, 0, 3, "Oil live MTD", text_color=textCol, bgcolor=leftBg)
+    table.cell(tb, 1, 3, f_pct(oilMTD) + " | z " + f_num(zOilLive), text_color=textCol, bgcolor=rightBg)
+
+    table.cell(tb, 0, 4, "Nowcast pressure", text_color=textCol, bgcolor=leftBg)
+    table.cell(tb, 1, 4, panelView == 3 ? hPressureLabel + " | " + hPressureDir : selPressureLabel + " | " + selPressureDir, text_color=textCol, bgcolor=liveBg)
+
+    table.cell(tb, 0, 5, "Confidence", text_color=textCol, bgcolor=leftBg)
+    table.cell(tb, 1, 5, panelView == 3 ? dashboardConf : selConfLabel, text_color=textCol, bgcolor=confBg)
+
+    table.cell(tb, 0, 6, "Direct channel", text_color=textCol, bgcolor=leftBg)
+    table.cell(tb, 1, 6, panelView == 1 ? dDirectConfirm : dashboardDirectConfirm, text_color=textCol, bgcolor=directBg)
+
+    table.cell(tb, 0, 7, "Quan he lich su", text_color=textCol, bgcolor=leftBg)
+    table.cell(tb, 1, 7, panelView == 3 ? dashboardHistText : f_strength(selBestCorr, strongCorrThr, midCorrThr) + " | " + f_sign(selBestCorr), text_color=textCol, bgcolor=rightBg)
+
+    table.cell(tb, 0, 8, "Do tre troi", text_color=textCol, bgcolor=leftBg)
+    table.cell(tb, 1, 8, panelView == 3 ? dashboardLagText : f_lag_text(selBestLag), text_color=textCol, bgcolor=rightBg)
+
+    table.cell(tb, 0, 9, "Do nhay CPI voi dau", text_color=textCol, bgcolor=leftBg)
+    table.cell(tb, 1, 9, f_num(selBeta0), text_color=textCol, bgcolor=rightBg)
+
+    table.cell(tb, 0, 10, "Do on dinh mo hinh", text_color=textCol, bgcolor=leftBg)
+    table.cell(tb, 1, 10, panelView == 3 ? dashboardModelStatus : selModelStatus, text_color=textCol, bgcolor=modelBg)
+
+    table.cell(tb, 0, 11, "CPI tham chieu", text_color=textCol, bgcolor=leftBg)
+    table.cell(tb, 1, 11, f_pct(selRefCpi), text_color=textCol, bgcolor=rightBg)
+
+    table.cell(tb, 0, 12, "Ket luan", text_color=textCol, bgcolor=leftBg)
+    table.cell(tb, 1, 12, panelView == 3 ? dashboardTakeaway : f_takeaway(selPressureLabel, selRegime, selTargetName), text_color=textCol, bgcolor=color.rgb(36, 44, 60))
