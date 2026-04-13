@@ -1,0 +1,961 @@
+//@version=6
+indicator("VN Dau-CPI Operational Build v3.3.2", shorttitle="VN Dau-CPI OB v3.3.2", overlay=false, max_labels_count=500, max_lines_count=300, max_bars_back=5000)
+
+//======================================================
+// 1) CHINH SACH CO DINH
+//======================================================
+const string MA_DAU       = "TVC:UKOIL"
+const string CPI_MOM_GOC  = "ECONOMICS:VNIRMM"
+const string CPI_YOY_GOC  = "ECONOMICS:VNIRYY"
+const string CPI_VANTAI   = "ECONOMICS:VNCPIT"
+const int DO_TRE_CPI      = 1
+
+//======================================================
+// 2) DAU VAO
+//======================================================
+nhomMoHinh    = "1. Mo hinh"
+nhomHienThi   = "2. Hien thi"
+nhomNguong    = "3. Nguong"
+nhomTruyenDan = "4. Truyen dan"
+nhomResearch  = "5. Research"
+
+cheDoBang = input.int(3, "Bang (1=Direct Lab, 2=Headline Lab, 3=Transmission)", minval=1, maxval=3, group=nhomHienThi)
+mucTieuTongThe = input.string("CPI MoM", "Muc tieu tong the", options=["CPI MoM", "CPI YoY"], group=nhomMoHinh)
+
+doDaiCorr      = input.int(24, "Cua so tuong quan (thang)", minval=12, maxval=60, group=nhomMoHinh)
+doDaiZ         = input.int(24, "Cua so z-score", minval=12, maxval=60, group=nhomMoHinh)
+doDaiOnDinh    = input.int(12, "Cua so on dinh", minval=6, maxval=24, group=nhomMoHinh)
+doDaiSmoothVT  = input.int(3, "Lam muot VNCPIT", minval=1, maxval=12, group=nhomResearch)
+
+// default van giu Raw
+luaChonProxyDirect = input.string("VNCPIT Raw", "Proxy direct", options=["VNCPIT Raw", "VNCPIT Smooth", "Blended"], group=nhomResearch)
+
+nguongCorrManh = input.float(0.50, "Nguong corr manh", minval=0.20, maxval=0.90, step=0.05, group=nhomNguong)
+nguongCorrVua  = input.float(0.30, "Nguong corr vua", minval=0.10, maxval=0.80, step=0.05, group=nhomNguong)
+nguongShockZ   = input.float(1.00, "Nguong shock dau z", minval=0.50, maxval=3.00, step=0.10, group=nhomNguong)
+
+nguongKheHo    = input.float(0.12, "Nguong muc khuech dai", minval=0.02, maxval=1.00, step=0.01, group=nhomTruyenDan)
+soThangXacNhan = input.int(3, "So thang xac nhan truyen dan", minval=1, maxval=12, group=nhomTruyenDan)
+nguongHeThong  = input.float(0.22, "Nguong stress he thong", minval=0.05, maxval=1.50, step=0.01, group=nhomTruyenDan)
+lamMuotF2      = input.int(3, "Lam muot diem truyen dan", minval=1, maxval=12, group=nhomTruyenDan)
+
+hienBang       = input.bool(true, "Hien bang tom tat", group=nhomHienThi)
+hienNen        = input.bool(true, "Hien nen theo trang thai", group=nhomHienThi)
+hienDuongDau   = input.bool(true, "Hien duong shock dau", group=nhomHienThi)
+hienDuongDiem  = input.bool(true, "Hien cac duong diem", group=nhomHienThi)
+hienNhanDuong  = input.bool(true, "Hien nhan ten duong", group=nhomHienThi)
+
+//======================================================
+// 3) HAM HO TRO
+//======================================================
+f_phanTram(v) =>
+    na(v) ? "NA" : str.tostring(v, "#.##") + "%"
+
+f_so(v) =>
+    na(v) ? "NA" : str.tostring(v, "#.###")
+
+f_z(src, len) =>
+    _m = ta.sma(src, len)
+    _s = ta.stdev(src, len)
+    na(_m) or na(_s) or _s == 0 ? na : (src - _m) / _s
+
+f_ep(v, lo, hi) =>
+    math.max(lo, math.min(hi, v))
+
+f_chuanHoa01(v, lo, hi) =>
+    na(v) or hi == lo ? na : f_ep((v - lo) / (hi - lo), 0.0, 1.0)
+
+f_beta(x, y, len) =>
+    _corr = ta.correlation(x, y, len)
+    _sx   = ta.stdev(x, len)
+    _sy   = ta.stdev(y, len)
+    not na(_corr) and not na(_sx) and not na(_sy) and _sx != 0 ? _corr * (_sy / _sx) : na
+
+f_best_lag_012(c0, c1, c2) =>
+    _a0 = na(c0) ? -1.0 : math.abs(c0)
+    _a1 = na(c1) ? -1.0 : math.abs(c1)
+    _a2 = na(c2) ? -1.0 : math.abs(c2)
+    _lag = 0
+    _val = _a0
+    if _a1 > _val
+        _val := _a1
+        _lag := 1
+    if _a2 > _val
+        _val := _a2
+        _lag := 2
+    [_lag, _val]
+
+f_khoangCach(c0, c1, c2, bestLag) =>
+    _a0 = na(c0) ? 0.0 : math.abs(c0)
+    _a1 = na(c1) ? 0.0 : math.abs(c1)
+    _a2 = na(c2) ? 0.0 : math.abs(c2)
+    _tot = bestLag == 0 ? _a0 : bestLag == 1 ? _a1 : _a2
+    _nhi = 0.0
+    if bestLag == 0
+        _nhi := math.max(_a1, _a2)
+    else if bestLag == 1
+        _nhi := math.max(_a0, _a2)
+    else
+        _nhi := math.max(_a0, _a1)
+    _tot - _nhi
+
+f_doDongDau(src, len) =>
+    _cungDau = 0.0
+    _dem = 0.0
+    for i = 0 to len - 1
+        if not na(src[i]) and not na(src[i + 1])
+            _dem += 1
+            if (src[i] >= 0 and src[i + 1] >= 0) or (src[i] < 0 and src[i + 1] < 0)
+                _cungDau += 1
+    _dem > 0 ? _cungDau / _dem : na
+
+f_cheDoOnDinh(corrSeries, betaSeries, lagGap, nguongManh, nguongVua, len) =>
+    _tbAbsCorr = ta.sma(math.abs(corrSeries), len)
+    _stdCorr   = ta.stdev(corrSeries, len)
+    _dongNhatBeta = f_doDongDau(betaSeries, len)
+
+    float _diem = 0.0
+    if not na(_tbAbsCorr)
+        if _tbAbsCorr >= nguongManh
+            _diem += 2.0
+        else if _tbAbsCorr >= nguongVua
+            _diem += 1.0
+
+    if not na(_stdCorr)
+        if _stdCorr <= 0.10
+            _diem += 2.0
+        else if _stdCorr <= 0.20
+            _diem += 1.0
+
+    if not na(_dongNhatBeta)
+        if _dongNhatBeta >= 0.85
+            _diem += 2.0
+        else if _dongNhatBeta >= 0.65
+            _diem += 1.0
+
+    if not na(lagGap)
+        if lagGap >= 0.15
+            _diem += 2.0
+        else if lagGap >= 0.05
+            _diem += 1.0
+
+    string _cheDo = "Yeu/Vo"
+    if _diem >= 7
+        _cheDo := "On dinh manh"
+    else if _diem >= 5
+        _cheDo := "On dinh vua"
+    else if _diem >= 3
+        _cheDo := "Khong on dinh"
+    else
+        _cheDo := "Yeu/Vo"
+
+    [_diem, _cheDo, _tbAbsCorr, _stdCorr, _dongNhatBeta]
+
+f_doTinCayLienKet(corrAbs, bestLag, cheDo) =>
+    float _nen = 0.0
+    if na(corrAbs)
+        _nen := 0.0
+    else if corrAbs >= 0.50
+        _nen := 0.85
+    else if corrAbs >= 0.30
+        _nen := 0.65
+    else if corrAbs >= 0.20
+        _nen := 0.48
+    else if corrAbs >= 0.10
+        _nen := 0.32
+    else
+        _nen := 0.18
+
+    float _phat = 0.0
+    if bestLag == 1
+        _phat := 0.08
+    else if bestLag == 2
+        _phat := 0.16
+
+    float _dieuChinh = 0.0
+    if cheDo == "On dinh manh"
+        _dieuChinh := 0.10
+    else if cheDo == "On dinh vua"
+        _dieuChinh := 0.03
+    else if cheDo == "Khong on dinh"
+        _dieuChinh := -0.05
+    else
+        _dieuChinh := -0.12
+
+    _conf = math.max(0.0, math.min(1.0, _nen - _phat + _dieuChinh))
+
+    string _nhan = "Thap"
+    if _conf >= 0.72
+        _nhan := "Cao"
+    else if _conf >= 0.48
+        _nhan := "Vua"
+    else
+        _nhan := "Thap"
+
+    [_conf, _nhan]
+
+f_xacNhanTrucTiep(cheDo, apLucNhan, corr0Abs) =>
+    string _out = "Yeu"
+    if (cheDo == "On dinh manh" or cheDo == "On dinh vua") and (apLucNhan == "Cao" or apLucNhan == "Vua") and not na(corr0Abs) and corr0Abs >= 0.20
+        _out := "Xac nhan"
+    else if not na(corr0Abs) and corr0Abs >= 0.12 and (apLucNhan == "Cao" or apLucNhan == "Vua")
+        _out := "Co dau hieu"
+    else
+        _out := "Yeu"
+    _out
+
+f_textDoTre(bestLag) =>
+    string _out = "Khong ro"
+    if bestLag == 0
+        _out := "Cung thang"
+    else if bestLag == 1
+        _out := "Tre 1 thang"
+    else if bestLag == 2
+        _out := "Tre 2 thang"
+    _out
+
+f_cheDoTruyenDan(f1, f2, gap, soThang, nguongGap, nguongHeThong, xacNhanTrucTiep, xacNhanHeThong) =>
+    _trucTiepNow = not na(f1) and f1 >= 0.10 and xacNhanTrucTiep >= 1
+    _khuechDaiNow = not na(gap) and gap >= nguongGap and not na(f2) and f2 >= 0.55 and xacNhanHeThong >= 2
+    _heThongNow = not na(gap) and gap >= nguongHeThong and not na(f2) and f2 >= 0.70 and xacNhanHeThong >= 2
+
+    _trucTiepPersist = ta.barssince(not _trucTiepNow) >= soThang - 1
+    _khuechDaiPersist = ta.barssince(not _khuechDaiNow) >= soThang - 1
+    _heThongPersist = ta.barssince(not _heThongNow) >= soThang - 1
+
+    string _cheDo = "Binh thuong"
+    if _heThongPersist
+        _cheDo := "Stress he thong"
+    else if _khuechDaiPersist
+        _cheDo := "Khuech dai"
+    else if _trucTiepPersist
+        _cheDo := "Shock truc tiep"
+    else if not na(f1) and f1 > 0
+        _cheDo := "Som"
+    else
+        _cheDo := "Binh thuong"
+    _cheDo
+
+f_nhanApLuc(v, zThr) =>
+    string _out = "Thap"
+    if not na(v)
+        if v >= zThr * 0.30
+            _out := "Cao"
+        else if v > 0
+            _out := "Vua"
+        else if v <= -zThr * 0.30
+            _out := "Giam ap luc"
+        else
+            _out := "Thap"
+    _out
+
+f_huongApLuc(v, zThr) =>
+    string _out = "NA"
+    if not na(v)
+        if v >= zThr * 0.30
+            _out := "Tang"
+        else if v > 0
+            _out := "Tang"
+        else if v <= -zThr * 0.30
+            _out := "Giam"
+        else
+            _out := "Di ngang"
+    _out
+
+f_doManhHienTai(apLucNhan, gap, cheDoTong, xacNhanTrucTiep) =>
+    float _score = 0.0
+
+    if cheDoTong == "Stress he thong"
+        _score += 0.45
+    else if cheDoTong == "Khuech dai"
+        _score += 0.35
+    else if cheDoTong == "Shock truc tiep"
+        _score += 0.22
+    else if cheDoTong == "Som"
+        _score += 0.10
+
+    if apLucNhan == "Cao"
+        _score += 0.35
+    else if apLucNhan == "Vua"
+        _score += 0.20
+    else if apLucNhan == "Giam ap luc"
+        _score -= 0.10
+
+    if not na(gap)
+        if gap >= 0.25
+            _score += 0.20
+        else if gap >= 0.12
+            _score += 0.10
+        else if gap > 0
+            _score += 0.05
+
+    if xacNhanTrucTiep == "Xac nhan"
+        _score += 0.15
+    else if xacNhanTrucTiep == "Co dau hieu"
+        _score += 0.05
+    else
+        _score -= 0.08
+
+    _score := f_ep(_score, 0.0, 1.0)
+
+    string _label = "Thap"
+    if _score >= 0.75
+        _label := "Rat manh"
+    else if _score >= 0.50
+        _label := "Manh"
+    else if _score >= 0.28
+        _label := "Vua"
+    else
+        _label := "Thap"
+
+    [_score, _label]
+
+// giu nguyen ban siết v3.3.1
+f_tinCayCheDo(mucKhuechDai, cheDoTong, tongXacNhan, doDai) =>
+    _gapDuongTyLe = ta.sma((not na(mucKhuechDai) and mucKhuechDai > 0) ? 1.0 : 0.0, doDai)
+    _gapOnDinh = ta.stdev(mucKhuechDai, doDai)
+    _xacNhanHeThong = f_chuanHoa01(tongXacNhan, 0.0, 3.0)
+
+    float _score = 0.0
+
+    if not na(_gapDuongTyLe)
+        if _gapDuongTyLe >= 0.88
+            _score += 0.36
+        else if _gapDuongTyLe >= 0.72
+            _score += 0.24
+        else if _gapDuongTyLe >= 0.55
+            _score += 0.12
+
+    if not na(_gapOnDinh)
+        if _gapOnDinh <= 0.10
+            _score += 0.20
+        else if _gapOnDinh <= 0.16
+            _score += 0.12
+        else if _gapOnDinh <= 0.24
+            _score += 0.05
+
+    if not na(_xacNhanHeThong)
+        _score += 0.22 * _xacNhanHeThong
+
+    if cheDoTong == "Stress he thong"
+        _score += 0.06
+    else if cheDoTong == "Khuech dai"
+        _score += 0.05
+    else if cheDoTong == "Shock truc tiep"
+        _score += 0.02
+
+    _score := f_ep(_score, 0.0, 1.0)
+
+    string _label = "Thap"
+    if _score >= 0.78
+        _label := "Cao"
+    else if _score >= 0.50
+        _label := "Vua"
+    else
+        _label := "Thap"
+
+    [_score, _label]
+
+//======================================================
+// 4) DU LIEU
+//======================================================
+dauM     = request.security(MA_DAU, "M", close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+dauMoM   = request.security(MA_DAU, "M", open,  gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+cpiMoMRaw = request.security(CPI_MOM_GOC, "M", close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+cpiYoYRaw = request.security(CPI_YOY_GOC, "M", close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+vncpitRaw = request.security(CPI_VANTAI, "M", close, gaps=barmerge.gaps_off, lookahead=barmerge.lookahead_off)
+
+//======================================================
+// 5) CAN CHINH CHUOI
+//======================================================
+dauRetM  = not na(dauM) and not na(dauM[1]) ? (dauM / dauM[1] - 1.0) * 100.0 : na
+dauMTD   = not na(dauM) and not na(dauMoM) and dauMoM != 0 ? (dauM / dauMoM - 1.0) * 100.0 : na
+zDauSong = f_z(dauMTD, doDaiZ)
+
+cpiMoMRef = cpiMoMRaw[DO_TRE_CPI]
+cpiYoYRef = cpiYoYRaw[DO_TRE_CPI]
+
+float cpiTongTheRef = na
+if mucTieuTongThe == "CPI MoM"
+    cpiTongTheRef := cpiMoMRef
+else
+    cpiTongTheRef := cpiYoYRef
+
+vncpitMoMRaw = not na(vncpitRaw) and not na(vncpitRaw[1]) and vncpitRaw[1] != 0 ? (vncpitRaw / vncpitRaw[1] - 1.0) * 100.0 : na
+vncpitSmooth = ta.sma(vncpitMoMRaw, doDaiSmoothVT)
+
+float proxyDirect = na
+if luaChonProxyDirect == "VNCPIT Raw"
+    proxyDirect := vncpitMoMRaw[DO_TRE_CPI]
+else if luaChonProxyDirect == "VNCPIT Smooth"
+    proxyDirect := vncpitSmooth[DO_TRE_CPI]
+else
+    proxyDirect := 0.50 * vncpitMoMRaw[DO_TRE_CPI] + 0.50 * vncpitSmooth[DO_TRE_CPI]
+
+vncpitRef = vncpitMoMRaw[DO_TRE_CPI]
+
+//======================================================
+// 6) KENH TRUC TIEP: DAU -> PROXY DIRECT
+//======================================================
+duDuLieuTrucTiep = not na(proxyDirect) and not na(proxyDirect[doDaiCorr]) and not na(dauRetM[DO_TRE_CPI + 2])
+
+dCorr0_raw = ta.correlation(dauRetM[DO_TRE_CPI],     proxyDirect, doDaiCorr)
+dCorr1_raw = ta.correlation(dauRetM[DO_TRE_CPI + 1], proxyDirect, doDaiCorr)
+dCorr2_raw = ta.correlation(dauRetM[DO_TRE_CPI + 2], proxyDirect, doDaiCorr)
+dBeta0_raw = f_beta(dauRetM[DO_TRE_CPI], proxyDirect, doDaiCorr)
+
+dCorr0 = duDuLieuTrucTiep ? dCorr0_raw : na
+dCorr1 = duDuLieuTrucTiep ? dCorr1_raw : na
+dCorr2 = duDuLieuTrucTiep ? dCorr2_raw : na
+dBeta0 = duDuLieuTrucTiep ? dBeta0_raw : na
+
+[dBestLag, _dBestAbs] = f_best_lag_012(dCorr0, dCorr1, dCorr2)
+
+float dBestCorr = na
+if dBestLag == 0
+    dBestCorr := dCorr0
+else if dBestLag == 1
+    dBestCorr := dCorr1
+else
+    dBestCorr := dCorr2
+
+dGap = f_khoangCach(dCorr0, dCorr1, dCorr2, dBestLag)
+[dDiemOnDinh, dCheDo, dTbAbsCorr, dStdCorr, dDongNhatBeta] = f_cheDoOnDinh(dCorr0, dBeta0, dGap, nguongCorrManh, nguongCorrVua, doDaiOnDinh)
+
+dApLuc = not na(zDauSong) and not na(dCorr0) ? zDauSong * dCorr0 : na
+dNhanApLuc = f_nhanApLuc(dApLuc, nguongShockZ)
+dHuongApLuc = f_huongApLuc(dApLuc, nguongShockZ)
+
+[dTinCayDirectScore, dTinCayDirectNhan] = f_doTinCayLienKet(math.abs(dCorr0), dBestLag, dCheDo)
+dXacNhan = f_xacNhanTrucTiep(dCheDo, dNhanApLuc, math.abs(dCorr0))
+
+//======================================================
+// 7) KENH TONG THE: DAU -> CPI TONG THE
+//======================================================
+duDuLieuTongThe = not na(cpiTongTheRef) and not na(cpiTongTheRef[doDaiCorr]) and not na(dauRetM[DO_TRE_CPI + 2])
+
+hCorr0_raw = ta.correlation(dauRetM[DO_TRE_CPI],     cpiTongTheRef, doDaiCorr)
+hCorr1_raw = ta.correlation(dauRetM[DO_TRE_CPI + 1], cpiTongTheRef, doDaiCorr)
+hCorr2_raw = ta.correlation(dauRetM[DO_TRE_CPI + 2], cpiTongTheRef, doDaiCorr)
+hBeta0_raw = f_beta(dauRetM[DO_TRE_CPI], cpiTongTheRef, doDaiCorr)
+
+hCorr0 = duDuLieuTongThe ? hCorr0_raw : na
+hCorr1 = duDuLieuTongThe ? hCorr1_raw : na
+hCorr2 = duDuLieuTongThe ? hCorr2_raw : na
+hBeta0 = duDuLieuTongThe ? hBeta0_raw : na
+
+[hBestLag, _hBestAbs] = f_best_lag_012(hCorr0, hCorr1, hCorr2)
+
+float hBestCorr = na
+if hBestLag == 0
+    hBestCorr := hCorr0
+else if hBestLag == 1
+    hBestCorr := hCorr1
+else
+    hBestCorr := hCorr2
+
+hGap = f_khoangCach(hCorr0, hCorr1, hCorr2, hBestLag)
+[hDiemOnDinh, hCheDo, hTbAbsCorr, hStdCorr, hDongNhatBeta] = f_cheDoOnDinh(hCorr0, hBeta0, hGap, nguongCorrManh, nguongCorrVua, doDaiOnDinh)
+
+hApLuc = not na(zDauSong) and not na(hCorr0) ? zDauSong * hCorr0 : na
+hNhanApLuc = f_nhanApLuc(hApLuc, nguongShockZ)
+hHuongApLuc = f_huongApLuc(hApLuc, nguongShockZ)
+
+[hTinCayHeadlineScore, hTinCayHeadlineNhan] = f_doTinCayLienKet(math.abs(hCorr0), hBestLag, hCheDo)
+hXacNhan = f_xacNhanTrucTiep(hCheDo, hNhanApLuc, math.abs(hCorr0))
+
+//======================================================
+// 8) LOP KHUYECH DAI
+//======================================================
+float apLucTrucTiep = na
+if not na(dApLuc) and not na(hApLuc)
+    apLucTrucTiep := 0.45 * dApLuc + 0.55 * hApLuc
+else if not na(hApLuc)
+    apLucTrucTiep := hApLuc
+else if not na(dApLuc)
+    apLucTrucTiep := dApLuc
+
+blockApLucTongThe   = f_chuanHoa01(hApLuc, -nguongShockZ, nguongShockZ)
+blockApLucTrucTiep = f_chuanHoa01(dApLuc, -nguongShockZ, nguongShockZ)
+
+float khoiSucEp = na
+if not na(blockApLucTongThe) and not na(blockApLucTrucTiep)
+    khoiSucEp := 0.65 * blockApLucTongThe + 0.35 * blockApLucTrucTiep
+else if not na(blockApLucTongThe)
+    khoiSucEp := blockApLucTongThe
+else if not na(blockApLucTrucTiep)
+    khoiSucEp := blockApLucTrucTiep
+
+blockOnDinhTongThe   = f_chuanHoa01(hDiemOnDinh, 0.0, 8.0)
+blockOnDinhTrucTiep = f_chuanHoa01(dDiemOnDinh, 0.0, 8.0)
+
+float khoiOnDinh = na
+if not na(blockOnDinhTongThe) and not na(blockOnDinhTrucTiep)
+    khoiOnDinh := 0.60 * blockOnDinhTongThe + 0.40 * blockOnDinhTrucTiep
+else if not na(blockOnDinhTongThe)
+    khoiOnDinh := blockOnDinhTongThe
+else if not na(blockOnDinhTrucTiep)
+    khoiOnDinh := blockOnDinhTrucTiep
+
+float khoiTinCay = na
+if not na(hTinCayHeadlineScore) and not na(dTinCayDirectScore)
+    khoiTinCay := 0.60 * hTinCayHeadlineScore + 0.40 * dTinCayDirectScore
+else if not na(hTinCayHeadlineScore)
+    khoiTinCay := hTinCayHeadlineScore
+else if not na(dTinCayDirectScore)
+    khoiTinCay := dTinCayDirectScore
+
+float diemXacNhanTrucTiep = 0.0
+if dXacNhan == "Xac nhan"
+    diemXacNhanTrucTiep := 1.0
+else if dXacNhan == "Co dau hieu"
+    diemXacNhanTrucTiep := 0.7
+else if dXacNhan == "Yeu"
+    diemXacNhanTrucTiep := 0.3
+else
+    diemXacNhanTrucTiep := 0.0
+
+int xn1 = 0
+int xn2 = 0
+int xn3 = 0
+
+if hNhanApLuc == "Cao" or hNhanApLuc == "Vua"
+    xn1 := 1
+if dNhanApLuc == "Cao" or dNhanApLuc == "Vua"
+    xn2 := 1
+if hCheDo == "On dinh manh" or hCheDo == "On dinh vua"
+    xn3 := 1
+
+tongXacNhan = xn1 + xn2 + xn3
+diemXacNhanHeThong = f_chuanHoa01(tongXacNhan, 0.0, 3.0)
+
+float phatDoTre = 0.0
+if hBestLag == 0
+    phatDoTre := 0.0
+else if hBestLag == 1
+    phatDoTre := 0.5
+else
+    phatDoTre := 1.0
+
+float khoiTruyenDan = na
+khoiTruyenDan := 0.55 * nz(diemXacNhanHeThong, 0.0) + 0.45 * diemXacNhanTrucTiep - 0.25 * phatDoTre
+khoiTruyenDan := f_ep(khoiTruyenDan, 0.0, 1.0)
+
+truyenDanRongRaw = 0.35 * nz(khoiSucEp, 0.50) + 0.25 * nz(khoiOnDinh, 0.50) + 0.20 * nz(khoiTinCay, 0.50) + 0.20 * nz(khoiTruyenDan, 0.50)
+truyenDanRong = ta.sma(truyenDanRongRaw, lamMuotF2)
+
+mucKhuechDai = not na(truyenDanRong) and not na(apLucTrucTiep) ? truyenDanRong - apLucTrucTiep : na
+
+cheDoTong = f_cheDoTruyenDan(
+    apLucTrucTiep,
+    truyenDanRong,
+    mucKhuechDai,
+    soThangXacNhan,
+    nguongKheHo,
+    nguongHeThong,
+    diemXacNhanTrucTiep,
+    tongXacNhan
+)
+
+string xuHuongCheDo = "NA"
+if not na(mucKhuechDai)
+    if mucKhuechDai > 0 and mucKhuechDai > nz(mucKhuechDai[1])
+        xuHuongCheDo := "Dang mo rong"
+    else if mucKhuechDai > 0
+        xuHuongCheDo := "Dang hoat dong"
+    else
+        xuHuongCheDo := "Chua kich hoat"
+
+[tinCayCheDoScore, tinCayCheDoNhan] = f_tinCayCheDo(mucKhuechDai, cheDoTong, tongXacNhan, doDaiOnDinh)
+
+string nhanApLucHienTai = hNhanApLuc
+if cheDoBang == 1
+    nhanApLucHienTai := dNhanApLuc
+else if cheDoBang == 2
+    nhanApLucHienTai := hNhanApLuc
+else
+    nhanApLucHienTai := hNhanApLuc
+
+string huongApLucHienTai = hHuongApLuc
+if cheDoBang == 1
+    huongApLucHienTai := dHuongApLuc
+else if cheDoBang == 2
+    huongApLucHienTai := hHuongApLuc
+else
+    huongApLucHienTai := hHuongApLuc
+
+string xacNhanHienTai = hXacNhan
+if cheDoBang == 1
+    xacNhanHienTai := dXacNhan
+else if cheDoBang == 2
+    xacNhanHienTai := hXacNhan
+else
+    if dXacNhan == "Xac nhan" or hXacNhan == "Xac nhan"
+        xacNhanHienTai := "Xac nhan"
+    else if dXacNhan == "Co dau hieu" or hXacNhan == "Co dau hieu"
+        xacNhanHienTai := "Co dau hieu"
+    else
+        xacNhanHienTai := "Yeu"
+
+[doManhScore, doManhHienTai] = f_doManhHienTai(nhanApLucHienTai, mucKhuechDai, cheDoTong, xacNhanHienTai)
+
+string tinCayDirectHienTai = hTinCayHeadlineNhan
+if cheDoBang == 1
+    tinCayDirectHienTai := dTinCayDirectNhan
+else if cheDoBang == 2
+    tinCayDirectHienTai := hTinCayHeadlineNhan
+else
+    if dTinCayDirectNhan == "Cao" or hTinCayHeadlineNhan == "Cao"
+        tinCayDirectHienTai := "Cao"
+    else if dTinCayDirectNhan == "Vua" or hTinCayHeadlineNhan == "Vua"
+        tinCayDirectHienTai := "Vua"
+    else
+        tinCayDirectHienTai := "Thap"
+
+//======================================================
+// 9) KET LUAN VAN HANH
+//======================================================
+f_ketLuanVanHanh(doManh, cheDoTong, tinCayCheDo, xacNhanTrucTiep, mucKhuechDai, apLucNhan) =>
+    string _out = "Chua xac nhan"
+
+    _gapDuong = not na(mucKhuechDai) and mucKhuechDai > 0
+    _coCanhBao = xacNhanTrucTiep == "Xac nhan" or xacNhanTrucTiep == "Co dau hieu"
+
+    if doManh == "Rat manh" and (cheDoTong == "Khuech dai" or cheDoTong == "Stress he thong") and (tinCayCheDo == "Vua" or tinCayCheDo == "Cao")
+        _out := "Canh bao manh"
+    else if (doManh == "Manh" or doManh == "Rat manh") and _gapDuong and _coCanhBao
+        _out := "Canh bao"
+    else if apLucNhan == "Cao" or apLucNhan == "Vua" or _gapDuong
+        _out := "Theo doi"
+    else
+        _out := "Chua xac nhan"
+
+    _out
+
+f_tomTatVanHanh(ketLuanVanHanh, cheDoTong, doManh, tinCayDirect, tinCayCheDo) =>
+    string _txt = "Tin hieu chua ro."
+    if ketLuanVanHanh == "Canh bao manh"
+        _txt := "Shock manh | " + cheDoTong + " dang hoat dong | Muc canh bao: Canh bao manh."
+    else if ketLuanVanHanh == "Canh bao"
+        _txt := "Shock ro | Truyen dan dang mo rong | Muc canh bao: Canh bao."
+    else if ketLuanVanHanh == "Theo doi"
+        _txt := "Shock dang hinh thanh tac dong | Muc canh bao: Theo doi."
+    else
+        _txt := "Chua du xac nhan de nang muc canh bao."
+
+    _txt := _txt + " Do manh: " + doManh + "."
+    _txt := _txt + " Direct: " + tinCayDirect + "."
+    _txt := _txt + " Che do: " + tinCayCheDo + "."
+    _txt
+
+ketLuanVanHanh = f_ketLuanVanHanh(doManhHienTai, cheDoTong, tinCayCheDoNhan, xacNhanHienTai, mucKhuechDai, nhanApLucHienTai)
+tomTatVanHanh = f_tomTatVanHanh(ketLuanVanHanh, cheDoTong, doManhHienTai, tinCayDirectHienTai, tinCayCheDoNhan)
+
+//======================================================
+// 10) LUA CHON GOC NHIN
+//======================================================
+string tenBang = "Transmission"
+if cheDoBang == 1
+    tenBang := "Direct Lab"
+else if cheDoBang == 2
+    tenBang := "Headline Lab"
+else
+    tenBang := "Transmission"
+
+string tenProxy = luaChonProxyDirect
+
+//======================================================
+// 11) NEN
+//======================================================
+color mauNen = na
+if cheDoBang == 1
+    if dNhanApLuc == "Cao"
+        mauNen := color.new(color.orange, 90)
+    else if dNhanApLuc == "Vua"
+        mauNen := color.new(color.yellow, 91)
+    else if dNhanApLuc == "Giam ap luc"
+        mauNen := color.new(color.teal, 91)
+    else
+        mauNen := color.new(color.gray, 93)
+else if cheDoBang == 2
+    if hNhanApLuc == "Cao"
+        mauNen := color.new(color.orange, 90)
+    else if hNhanApLuc == "Vua"
+        mauNen := color.new(color.yellow, 91)
+    else if hNhanApLuc == "Giam ap luc"
+        mauNen := color.new(color.teal, 91)
+    else
+        mauNen := color.new(color.gray, 93)
+else
+    if ketLuanVanHanh == "Canh bao manh"
+        mauNen := color.new(color.maroon, 84)
+    else if ketLuanVanHanh == "Canh bao"
+        mauNen := color.new(color.red, 88)
+    else if ketLuanVanHanh == "Theo doi"
+        mauNen := color.new(color.orange, 90)
+    else
+        mauNen := color.new(color.gray, 93)
+
+bgcolor(hienNen ? mauNen : na)
+
+//======================================================
+// 12) VE DO THI
+//======================================================
+hline(0, "Moc 0", color=color.new(color.gray, 72))
+hline(1, "Moc cao", color=color.new(color.red, 88))
+hline(-1, "Moc thap", color=color.new(color.teal, 88))
+
+float duongShockDau = na
+if cheDoBang != 3
+    duongShockDau := zDauSong
+
+float duongApLucBang = na
+if cheDoBang == 1
+    duongApLucBang := dApLuc
+else if cheDoBang == 2
+    duongApLucBang := hApLuc
+else
+    duongApLucBang := na
+
+float duongApLucTrucTiep = na
+if cheDoBang == 3
+    duongApLucTrucTiep := apLucTrucTiep
+
+float duongTruyenDanRong = na
+if cheDoBang == 3
+    duongTruyenDanRong := truyenDanRong
+
+float duongMucKhuechDai = na
+if cheDoBang == 3
+    duongMucKhuechDai := mucKhuechDai
+
+plot(hienDuongDau ? duongShockDau : na, "Shock dau", color=color.orange, linewidth=3)
+plot(hienDuongDiem ? duongApLucBang : na, "Ap luc CPI", color=cheDoBang == 1 ? color.yellow : color.aqua, linewidth=3)
+plot(hienDuongDiem ? duongApLucTrucTiep : na, "Ap luc truc tiep", color=color.yellow, linewidth=3)
+plot(hienDuongDiem ? duongTruyenDanRong : na, "Truyen dan rong", color=color.aqua, linewidth=3)
+plot(hienDuongDiem ? duongMucKhuechDai : na, "Muc khuech dai", color=color.fuchsia, linewidth=2, style=plot.style_histogram)
+
+//======================================================
+// 13) NHAN DUONG
+//======================================================
+var label nhan1 = na
+var label nhan2 = na
+var label nhan3 = na
+
+if barstate.islast and hienNhanDuong
+    if not na(nhan1)
+        label.delete(nhan1)
+    if not na(nhan2)
+        label.delete(nhan2)
+    if not na(nhan3)
+        label.delete(nhan3)
+
+    if cheDoBang == 1 or cheDoBang == 2
+        if hienDuongDau and not na(duongShockDau)
+            nhan1 := label.new(bar_index, duongShockDau, "Shock dau", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.white, color=color.new(color.orange, 0), size=size.small)
+        if hienDuongDiem and not na(duongApLucBang)
+            nhan2 := label.new(bar_index, duongApLucBang, cheDoBang == 1 ? "Ap luc proxy direct" : "Ap luc CPI tong the", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=cheDoBang == 1 ? color.black : color.white, color=cheDoBang == 1 ? color.new(color.yellow, 0) : color.new(color.aqua, 0), size=size.small)
+    else
+        if hienDuongDiem and not na(duongApLucTrucTiep)
+            nhan1 := label.new(bar_index, duongApLucTrucTiep, "Ap luc truc tiep", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.black, color=color.new(color.yellow, 0), size=size.small)
+        if hienDuongDiem and not na(duongTruyenDanRong)
+            nhan2 := label.new(bar_index, duongTruyenDanRong, "Truyen dan rong", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.white, color=color.new(color.aqua, 0), size=size.small)
+        if hienDuongDiem and not na(duongMucKhuechDai)
+            nhan3 := label.new(bar_index, duongMucKhuechDai, "Muc khuech dai", xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_left, textcolor=color.white, color=color.new(color.fuchsia, 0), size=size.small)
+
+//======================================================
+// 14) BANG TOM TAT
+//======================================================
+var table tb = table.new(position.top_right, 2, 13, border_width=1)
+
+mauHeader = color.rgb(58, 64, 80)
+mauTrai   = color.rgb(28, 30, 36)
+mauPhai   = color.rgb(18, 20, 25)
+mauChu    = color.white
+
+mauApLuc = color.rgb(70, 70, 70)
+if nhanApLucHienTai == "Cao"
+    mauApLuc := color.rgb(120, 35, 35)
+else if nhanApLucHienTai == "Vua"
+    mauApLuc := color.rgb(120, 85, 25)
+else if nhanApLucHienTai == "Giam ap luc"
+    mauApLuc := color.rgb(25, 95, 95)
+
+mauDoManh = color.rgb(70, 70, 70)
+if doManhHienTai == "Rat manh"
+    mauDoManh := color.rgb(120, 20, 20)
+else if doManhHienTai == "Manh"
+    mauDoManh := color.rgb(120, 40, 40)
+else if doManhHienTai == "Vua"
+    mauDoManh := color.rgb(110, 85, 25)
+else
+    mauDoManh := color.rgb(70, 70, 70)
+
+mauTinCay = color.rgb(70, 70, 70)
+if tinCayDirectHienTai == "Cao"
+    mauTinCay := color.rgb(35, 90, 45)
+else if tinCayDirectHienTai == "Vua"
+    mauTinCay := color.rgb(110, 85, 25)
+else
+    mauTinCay := color.rgb(95, 55, 40)
+
+mauTinCayCheDo = color.rgb(70, 70, 70)
+if tinCayCheDoNhan == "Cao"
+    mauTinCayCheDo := color.rgb(35, 90, 45)
+else if tinCayCheDoNhan == "Vua"
+    mauTinCayCheDo := color.rgb(110, 85, 25)
+else
+    mauTinCayCheDo := color.rgb(95, 55, 40)
+
+mauXacNhan = color.rgb(70, 70, 70)
+if xacNhanHienTai == "Xac nhan"
+    mauXacNhan := color.rgb(35, 90, 45)
+else if xacNhanHienTai == "Co dau hieu"
+    mauXacNhan := color.rgb(110, 85, 25)
+else
+    mauXacNhan := color.rgb(95, 55, 40)
+
+mauCheDo = color.rgb(70, 70, 70)
+if cheDoTong == "Stress he thong"
+    mauCheDo := color.rgb(110, 20, 20)
+else if cheDoTong == "Khuech dai"
+    mauCheDo := color.rgb(120, 40, 40)
+else if cheDoTong == "Shock truc tiep"
+    mauCheDo := color.rgb(110, 80, 25)
+else if cheDoTong == "Som"
+    mauCheDo := color.rgb(95, 95, 35)
+
+mauVanHanh = color.rgb(70, 70, 70)
+if ketLuanVanHanh == "Canh bao manh"
+    mauVanHanh := color.rgb(140, 15, 15)
+else if ketLuanVanHanh == "Canh bao"
+    mauVanHanh := color.rgb(130, 45, 25)
+else if ketLuanVanHanh == "Theo doi"
+    mauVanHanh := color.rgb(120, 90, 25)
+else
+    mauVanHanh := color.rgb(70, 70, 70)
+
+if barstate.islast and hienBang
+    table.cell(tb, 0, 0, "VN Dau-CPI v3.3.2 OB", text_color=mauChu, bgcolor=mauHeader)
+    table.cell(tb, 1, 0, tenBang, text_color=mauChu, bgcolor=mauHeader)
+
+    if cheDoBang == 1
+        table.cell(tb, 0, 1, "Shock dau", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 1, f_phanTram(dauMTD) + " | z " + f_so(zDauSong), text_color=mauChu, bgcolor=mauPhai)
+
+        table.cell(tb, 0, 2, "Proxy direct", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 2, tenProxy, text_color=mauChu, bgcolor=mauPhai)
+
+        table.cell(tb, 0, 3, "Ap luc proxy direct", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 3, dNhanApLuc + " | " + dHuongApLuc, text_color=mauChu, bgcolor=mauApLuc)
+
+        table.cell(tb, 0, 4, "Do manh hien tai", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 4, doManhHienTai, text_color=mauChu, bgcolor=mauDoManh)
+
+        table.cell(tb, 0, 5, "Tin cay lien ket", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 5, dTinCayDirectNhan, text_color=mauChu, bgcolor=mauTinCay)
+
+        table.cell(tb, 0, 6, "Xac nhan truc tiep", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 6, dXacNhan, text_color=mauChu, bgcolor=mauXacNhan)
+
+        table.cell(tb, 0, 7, "Do tre", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 7, f_textDoTre(dBestLag), text_color=mauChu, bgcolor=mauPhai)
+
+        table.cell(tb, 0, 8, "Gia tri proxy", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 8, f_phanTram(proxyDirect), text_color=mauChu, bgcolor=mauPhai)
+
+        table.cell(tb, 0, 9, "Ket luan van hanh", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 9, ketLuanVanHanh, text_color=mauChu, bgcolor=mauVanHanh)
+
+        table.cell(tb, 0, 10, "Ghi chu", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 10, "Dung de kiem dinh proxy direct", text_color=mauChu, bgcolor=color.rgb(36, 44, 60))
+
+        table.cell(tb, 0, 11, "", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 11, "", text_color=mauChu, bgcolor=mauPhai)
+
+        table.cell(tb, 0, 12, "", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 12, "", text_color=mauChu, bgcolor=mauPhai)
+
+    else if cheDoBang == 2
+        table.cell(tb, 0, 1, "Shock dau", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 1, f_phanTram(dauMTD) + " | z " + f_so(zDauSong), text_color=mauChu, bgcolor=mauPhai)
+
+        table.cell(tb, 0, 2, "Ap luc CPI tong the", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 2, hNhanApLuc + " | " + hHuongApLuc, text_color=mauChu, bgcolor=mauApLuc)
+
+        table.cell(tb, 0, 3, "Do manh hien tai", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 3, doManhHienTai, text_color=mauChu, bgcolor=mauDoManh)
+
+        table.cell(tb, 0, 4, "Tin cay lien ket", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 4, hTinCayHeadlineNhan, text_color=mauChu, bgcolor=mauTinCay)
+
+        table.cell(tb, 0, 5, "Xac nhan truc tiep", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 5, hXacNhan, text_color=mauChu, bgcolor=mauXacNhan)
+
+        table.cell(tb, 0, 6, "Do tre", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 6, f_textDoTre(hBestLag), text_color=mauChu, bgcolor=mauPhai)
+
+        table.cell(tb, 0, 7, "Gia tri CPI tham chieu", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 7, f_phanTram(cpiTongTheRef), text_color=mauChu, bgcolor=mauPhai)
+
+        table.cell(tb, 0, 8, "Ket luan van hanh", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 8, ketLuanVanHanh, text_color=mauChu, bgcolor=mauVanHanh)
+
+        table.cell(tb, 0, 9, "So sanh voi direct", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 9, "Proxy: " + tenProxy, text_color=mauChu, bgcolor=color.rgb(36, 44, 60))
+
+        table.cell(tb, 0, 10, "", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 10, "", text_color=mauChu, bgcolor=mauPhai)
+
+        table.cell(tb, 0, 11, "", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 11, "", text_color=mauChu, bgcolor=mauPhai)
+
+        table.cell(tb, 0, 12, "", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 12, "", text_color=mauChu, bgcolor=mauPhai)
+
+    else
+        table.cell(tb, 0, 1, "Shock dau", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 1, f_phanTram(dauMTD) + " | z " + f_so(zDauSong), text_color=mauChu, bgcolor=mauPhai)
+
+        table.cell(tb, 0, 2, "Ap luc hien tai", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 2, nhanApLucHienTai + " | " + huongApLucHienTai, text_color=mauChu, bgcolor=mauApLuc)
+
+        table.cell(tb, 0, 3, "Do manh hien tai", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 3, doManhHienTai, text_color=mauChu, bgcolor=mauDoManh)
+
+        table.cell(tb, 0, 4, "Tin cay direct", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 4, tinCayDirectHienTai, text_color=mauChu, bgcolor=mauTinCay)
+
+        table.cell(tb, 0, 5, "Tin cay che do", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 5, tinCayCheDoNhan, text_color=mauChu, bgcolor=mauTinCayCheDo)
+
+        table.cell(tb, 0, 6, "Xac nhan truc tiep", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 6, xacNhanHienTai, text_color=mauChu, bgcolor=mauXacNhan)
+
+        table.cell(tb, 0, 7, "Ap luc truc tiep", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 7, f_so(apLucTrucTiep), text_color=mauChu, bgcolor=mauPhai)
+
+        table.cell(tb, 0, 8, "Truyen dan rong", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 8, f_so(truyenDanRong), text_color=mauChu, bgcolor=mauPhai)
+
+        table.cell(tb, 0, 9, "Muc khuech dai", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 9, f_so(mucKhuechDai), text_color=mauChu, bgcolor=mauPhai)
+
+        table.cell(tb, 0, 10, "Che do", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 10, cheDoTong + " | " + xuHuongCheDo, text_color=mauChu, bgcolor=mauCheDo)
+
+        table.cell(tb, 0, 11, "Ket luan van hanh", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 11, ketLuanVanHanh, text_color=mauChu, bgcolor=mauVanHanh)
+
+        table.cell(tb, 0, 12, "Tom tat", text_color=mauChu, bgcolor=mauTrai)
+        table.cell(tb, 1, 12, tomTatVanHanh, text_color=mauChu, bgcolor=color.rgb(36, 44, 60))
+
+//======================================================
+// 15) CANH BAO
+//======================================================
+alertcondition(cheDoTong == "Shock truc tiep", "Shock truc tiep", "VN Dau-CPI: Shock truc tiep")
+alertcondition(cheDoTong == "Khuech dai", "Khuech dai", "VN Dau-CPI: Khuech dai")
+alertcondition(cheDoTong == "Stress he thong", "Stress he thong", "VN Dau-CPI: Stress he thong")
+alertcondition(ketLuanVanHanh == "Canh bao", "Canh bao", "VN Dau-CPI: Canh bao")
+alertcondition(ketLuanVanHanh == "Canh bao manh", "Canh bao manh", "VN Dau-CPI: Canh bao manh")
